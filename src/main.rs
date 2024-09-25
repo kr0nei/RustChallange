@@ -1,33 +1,68 @@
 use std::cmp::Ordering;
+use std::string::String;
+use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tungstenite::Message;
+use clap::Parser;
+use futures_util::stream::{SplitSink, SplitStream};
+use tokio::net::TcpStream;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Order {
     price: f64,
     quantity: f64,
     exchange: String,
 }
 
+#[derive(Parser)]
+#[command(version, about, long_about=None)]
+struct Args {
+    #[arg(short, long)]
+    currency_pair: String
+}
+
+
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+    let currency_pair: String;
 
-    let binance_data: Value = get_data_from_binance().await;
-     // println!("Received message: {:?}", binance_data);
+    if let pair = args.currency_pair {
+        currency_pair = pair;
+    } else {
+        currency_pair = "ethbtc".to_string();
+    }
 
-    let bitstamp_data: Value = get_data_from_bitstamp().await;
-    // println!("Received message: {:?}", bitstamp_data);
+    let bitstamp_url = "wss://ws.bitstamp.net";
+    let (bitstamp_ws_stream, _) = connect_async(bitstamp_url).await.expect("Failed to connect");
+    println!("Connected to bitstamp");
 
-    let (spread, top_bids, top_asks) = merge_and_get_top(binance_data, bitstamp_data);
-    // println!("Top 10 Bids: {:?}", top_bids);
-    // println!("Top 10 Asks: {:?}", top_asks);
-    // println!("Spread: {}", spread);
+    let (mut bitstamp_write, mut bitstamp_read) = bitstamp_ws_stream.split();
 
-    let final_data = data_to_json(spread, top_bids, top_asks);
-    println!("Final data: {:?}", final_data);
+    bitstamp_subscribe(currency_pair.to_string(), &mut bitstamp_write).await;
 
+    let binance_url = format!("wss://stream.binance.com:9443/ws/{}@depth20@100ms",currency_pair);
+    let (binance_ws_stream, _) = connect_async(binance_url).await.expect("Failed to connect");
+    println!("Connected to binance");
+
+    let (mut binance_write, mut binance_read) = binance_ws_stream.split();
+    binance_subscribe(currency_pair.to_string(), &mut binance_write).await;
+
+    let time = Duration::from_secs(5);
+    //println!("Top 10 Bids: {:?}", top_bids);
+    //println!("Top 10 Asks: {:?}", top_asks);
+    //println!("Spread: {}", spread);
+
+    loop {
+        let bitstamp_data: Value = get_data_from_bitstamp(&mut bitstamp_read).await;
+        let binance_data: Value = get_data_from_binance( &mut binance_read).await;
+        let (spread, top_bids, top_asks) = merge_and_get_top(binance_data,bitstamp_data);
+        let final_data = data_to_json(spread, top_bids, top_asks);
+        println!("Final data: {:?}", final_data);
+        tokio::time::sleep(time).await;
+    }
 }
 
 fn data_to_json(spread: f64, top_bids: Vec<Order>, top_asks: Vec<Order>) -> Value {
@@ -136,44 +171,50 @@ fn merge_and_get_top(data1: Value, data2: Value) -> (f64, Vec<Order>, Vec<Order>
 
 fn convert_string_numbers(json_value: &mut Value) {
     match json_value {
-        // Handle arrays recursively
         Value::Array(arr) => {
             for item in arr {
-                convert_string_numbers(item); // Recursively handle nested arrays
+                convert_string_numbers(item);
             }
         }
-        // Handle objects (i.e., maps)
         Value::Object(map) => {
             for (_, value) in map {
-                convert_string_numbers(value); // Recursively handle nested objects
+                convert_string_numbers(value);
             }
         }
-        // Handle strings that are numbers
         Value::String(s) => {
             if let Ok(num) = s.parse::<f64>() {
                 *json_value = Value::Number(serde_json::Number::from_f64(num).unwrap());
             }
         }
-        // Ignore other types
         _ => {}
     }
 }
 
-async fn get_data_from_bitstamp() -> Value {
-    let bitstamp_url = "wss://ws.bitstamp.net";
-    let (bitstamp_ws_stream, _) = connect_async(bitstamp_url).await.expect("Failed to connect");
-    println!("Connected to bitstamp");
-
-    let (mut bitstamp_write, mut bitstamp_read) = bitstamp_ws_stream.split();
+async fn bitstamp_subscribe(currency_pair: String, bitstamp_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>){
     let bitstamp_subscribe_json = json!({
         "event": "bts:subscribe",
         "data": {
-            "channel": "order_book_ethbtc"
+            "channel": format!("order_book_{}",currency_pair)
         }
     });
-    let bitstamp_subscribe = Message::Text(bitstamp_subscribe_json.to_string());
-    bitstamp_write.send(bitstamp_subscribe).await.expect("Failed to subscribe");
+    let bitstamp_subscribe_str = Message::Text(bitstamp_subscribe_json.to_string());
+    bitstamp_write.send(bitstamp_subscribe_str).await.expect("Failed to subscribe");
+}
 
+async fn binance_subscribe(currency_pair: String, binance_write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>) {
+    let binance_subscribe_json = json!({
+        "method": "SUBSCRIBE",
+        "params": [
+            format!("{}@aggTrade",currency_pair),
+            format!("{}@depth",currency_pair)
+        ],
+        "id": 1
+    });
+    let binance_subscribe = Message::Text(binance_subscribe_json.to_string());
+
+    binance_write.send(binance_subscribe).await.expect("Failed to subscribe");
+}
+async fn get_data_from_bitstamp(bitstamp_read: &mut SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>) -> Value {
     if let Some(msg) = bitstamp_read.next().await {
         match msg {
             Ok(msg) => {
@@ -213,24 +254,7 @@ async fn get_data_from_bitstamp() -> Value {
     }
 }
 
-async fn get_data_from_binance() -> Value {
-    let binance_url = "wss://stream.binance.com:9443/ws/ethbtc@depth20@100ms";
-    let (binance_ws_stream, _) = connect_async(binance_url).await.expect("Failed to connect");
-    println!("Connected to binance");
-
-    let (mut binance_write, mut binance_read) = binance_ws_stream.split();
-    let binance_subscribe_json = json!({
-        "method": "SUBSCRIBE",
-        "params": [
-            "ethbtc@aggTrade",
-            "ethbtc@depth"
-        ],
-        "id": 5
-    });
-    let binance_subscribe = Message::Text(binance_subscribe_json.to_string());
-
-    binance_write.send(binance_subscribe).await.expect("Failed to subscribe");
-
+async fn get_data_from_binance(binance_read: &mut SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>) -> Value {
     if let Some(message) = binance_read.next().await {
         let message = message.expect("Failed to receive message");
         if let Message::Text(dat) = message {
